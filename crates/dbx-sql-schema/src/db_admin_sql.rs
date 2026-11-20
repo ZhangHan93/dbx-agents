@@ -39,6 +39,8 @@ pub struct RenameObjectSqlOptions {
     pub schema: Option<String>,
     pub old_name: String,
     pub new_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,6 +59,8 @@ pub struct CreateDatabaseSqlOptions {
     pub charset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +177,8 @@ pub struct VacuumTableSqlOptions {
     pub full: bool,
     #[serde(default)]
     pub analyze: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,6 +204,8 @@ pub struct DropTableChildObjectSqlOptions {
     pub schema: Option<String>,
     pub table_name: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +214,8 @@ pub struct DatabaseNameSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_type: Option<DatabaseType>,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,6 +224,8 @@ pub struct SchemaNameSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_type: Option<DatabaseType>,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -231,6 +243,8 @@ pub struct DatabasePropertyEditSqlOptions {
     pub collation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,9 +344,11 @@ pub fn build_create_database_sql(options: CreateDatabaseSqlOptions) -> Result<St
     match options.target.unwrap_or(DatabaseCreationTarget::Database) {
         DatabaseCreationTarget::Database => build_create_database_statement(&options),
         // Schema creation is exposed through the same frontend dialog contract when the tree target is a database node.
-        DatabaseCreationTarget::Schema => {
-            build_create_schema_sql(SchemaNameSqlOptions { database_type: options.database_type, name: options.name })
-        }
+        DatabaseCreationTarget::Schema => build_create_schema_sql(SchemaNameSqlOptions {
+            database_type: options.database_type,
+            name: options.name,
+            identifier_quote: options.identifier_quote,
+        }),
         DatabaseCreationTarget::Catalog => Err("Creating catalogs is not supported yet.".to_string()),
         DatabaseCreationTarget::Namespace => Err("Creating namespaces is not supported yet.".to_string()),
     }
@@ -364,7 +380,8 @@ fn build_create_database_statement(options: &CreateDatabaseSqlOptions) -> Result
         // honors by running the statement on a sysmaster session pinned to that DB_LOCALE.
         return Ok(format!("-- DBX_DB_LOCALE={locale}\nCREATE DATABASE {name};"));
     }
-    let name = quote_table_identifier(options.database_type, &options.name);
+    let name =
+        quote_rename_identifier_with_quote(options.database_type, &options.name, options.identifier_quote.as_deref());
     let charset = clean_sql_option(options.charset.as_deref());
     let collation = clean_sql_option(options.collation.as_deref());
     if !supports_create_database_charset(options.database_type, options.driver_profile.as_deref()) || charset.is_empty()
@@ -567,8 +584,13 @@ fn supports_drop_table_cascade(database_type: Option<DatabaseType>) -> bool {
 
 pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions) -> Result<String, String> {
     let database_type = options.database_type;
-    let table = qualified_name(database_type, options.schema.as_deref(), &options.table_name);
-    let name = quote_rename_identifier(database_type, &options.name);
+    let table = qualified_name_with_quote(
+        database_type,
+        options.schema.as_deref(),
+        &options.table_name,
+        options.identifier_quote.as_deref(),
+    );
+    let name = quote_rename_identifier_with_quote(database_type, &options.name, options.identifier_quote.as_deref());
     match options.object_type {
         TableChildObjectType::Column => Ok(format!("ALTER TABLE {table} DROP COLUMN {name};")),
         TableChildObjectType::Index => {
@@ -598,7 +620,11 @@ pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions
                 )
             ) && options.schema.as_deref().is_some_and(|schema| !schema.is_empty())
             {
-                let schema = quote_rename_identifier(database_type, options.schema.as_deref().unwrap());
+                let schema = quote_rename_identifier_with_quote(
+                    database_type,
+                    options.schema.as_deref().unwrap(),
+                    options.identifier_quote.as_deref(),
+                );
                 return Ok(format!("DROP INDEX {schema}.{name};"));
             }
             Ok(format!("DROP INDEX {name};"))
@@ -632,7 +658,11 @@ pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions
                 && options.schema.as_deref().is_some_and(|schema| !schema.is_empty())
                 && !matches!(database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb))
             {
-                let schema = quote_rename_identifier(database_type, options.schema.as_deref().unwrap());
+                let schema = quote_rename_identifier_with_quote(
+                    database_type,
+                    options.schema.as_deref().unwrap(),
+                    options.identifier_quote.as_deref(),
+                );
                 Ok(format!("DROP TRIGGER {schema}.{name};"))
             } else {
                 Ok(format!("DROP TRIGGER {name};"))
@@ -703,7 +733,12 @@ pub fn build_vacuum_table_sql(options: VacuumTableSqlOptions) -> Result<String, 
     if !supports_vacuum_table(options.database_type) {
         return Err(format!("VACUUM is not supported for {}.", database_label(options.database_type)));
     }
-    let table = qualified_name(options.database_type, options.schema.as_deref(), &options.table_name);
+    let table = qualified_name_with_quote(
+        options.database_type,
+        options.schema.as_deref(),
+        &options.table_name,
+        options.identifier_quote.as_deref(),
+    );
     let full = if options.full { " FULL" } else { "" };
     let analyze = if options.analyze { " ANALYZE" } else { "" };
     Ok(format!("VACUUM{full}{analyze} {table};"))
@@ -777,7 +812,8 @@ fn supports_truncate_table_cascade(database_type: Option<DatabaseType>) -> bool 
 }
 
 pub fn build_drop_database_sql(options: DatabaseNameSqlOptions) -> String {
-    let name = quote_table_identifier(options.database_type, &options.name);
+    let name =
+        quote_rename_identifier_with_quote(options.database_type, &options.name, options.identifier_quote.as_deref());
     if options.database_type == Some(DatabaseType::Transwarp) {
         return format!("DROP DATABASE IF EXISTS {name};");
     }
@@ -788,13 +824,21 @@ pub fn build_update_database_properties_sql(options: DatabasePropertyEditSqlOpti
     match options.target {
         DatabasePropertyTarget::Database => {
             if options.comment.is_some() {
-                return build_database_comment_sql(options.database_type, &options.name, options.comment.as_deref());
+                return build_database_comment_sql(
+                    options.database_type,
+                    &options.name,
+                    options.comment.as_deref(),
+                    options.identifier_quote.as_deref(),
+                );
             }
             build_database_charset_sql(&options)
         }
-        DatabasePropertyTarget::Schema => {
-            build_schema_comment_sql(options.database_type, &options.name, options.comment.as_deref())
-        }
+        DatabasePropertyTarget::Schema => build_schema_comment_sql(
+            options.database_type,
+            &options.name,
+            options.comment.as_deref(),
+            options.identifier_quote.as_deref(),
+        ),
     }
 }
 
@@ -810,7 +854,10 @@ fn build_database_charset_sql(options: &DatabasePropertyEditSqlOptions) -> Resul
     if charset.is_empty() && collation.is_empty() {
         return Err("At least one charset or collation value is required.".to_string());
     }
-    let mut sql = format!("ALTER DATABASE {}", quote_table_identifier(options.database_type, &options.name));
+    let mut sql = format!(
+        "ALTER DATABASE {}",
+        quote_rename_identifier_with_quote(options.database_type, &options.name, options.identifier_quote.as_deref(),)
+    );
     if !charset.is_empty() {
         sql.push_str(&format!(" DEFAULT CHARACTER SET {charset}"));
     }
@@ -825,33 +872,47 @@ fn build_database_comment_sql(
     database_type: Option<DatabaseType>,
     name: &str,
     comment: Option<&str>,
+    identifier_quote: Option<&str>,
 ) -> Result<String, String> {
     if !supports_database_property_comment(database_type) {
         return Err(format!("Editing database comments is not supported for {}.", database_label(database_type)));
     }
-    Ok(format!("COMMENT ON DATABASE {} IS {};", quote_table_identifier(database_type, name), comment_literal(comment)))
+    Ok(format!(
+        "COMMENT ON DATABASE {} IS {};",
+        quote_rename_identifier_with_quote(database_type, name, identifier_quote),
+        comment_literal(comment)
+    ))
 }
 
 fn build_schema_comment_sql(
     database_type: Option<DatabaseType>,
     name: &str,
     comment: Option<&str>,
+    identifier_quote: Option<&str>,
 ) -> Result<String, String> {
     if !supports_database_property_comment(database_type) {
         return Err(format!("Editing schema comments is not supported for {}.", database_label(database_type)));
     }
-    Ok(format!("COMMENT ON SCHEMA {} IS {};", quote_table_identifier(database_type, name), comment_literal(comment)))
+    Ok(format!(
+        "COMMENT ON SCHEMA {} IS {};",
+        quote_rename_identifier_with_quote(database_type, name, identifier_quote),
+        comment_literal(comment)
+    ))
 }
 
 pub fn build_create_schema_sql(options: SchemaNameSqlOptions) -> Result<String, String> {
     if !supports_create_schema_target(options.database_type) {
         return Err(format!("Creating schemas is not supported for {}.", database_label(options.database_type)));
     }
-    Ok(format!("CREATE SCHEMA {};", quote_table_identifier(options.database_type, &options.name)))
+    Ok(format!(
+        "CREATE SCHEMA {};",
+        quote_rename_identifier_with_quote(options.database_type, &options.name, options.identifier_quote.as_deref())
+    ))
 }
 
 pub fn build_drop_schema_sql(options: SchemaNameSqlOptions) -> String {
-    let schema = quote_table_identifier(options.database_type, &options.name);
+    let schema =
+        quote_rename_identifier_with_quote(options.database_type, &options.name, options.identifier_quote.as_deref());
     if options.database_type == Some(DatabaseType::OceanbaseOracle) {
         // OceanBase Oracle mode models schemas as users, so dropping one drops the user.
         format!("DROP USER {schema} CASCADE;")
@@ -872,8 +933,12 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
         &options.source_name,
         options.identifier_quote.as_deref(),
     );
-    let target =
-        qualified_duplicate_target_name(options.database_type, options.schema.as_deref(), &options.target_name);
+    let target = qualified_duplicate_target_name(
+        options.database_type,
+        options.schema.as_deref(),
+        &options.target_name,
+        options.identifier_quote.as_deref(),
+    );
     let structure_sql = if matches!(
         options.database_type,
         Some(
@@ -913,14 +978,16 @@ pub fn build_duplicate_table_structure_sql(options: DuplicateTableStructureSqlOp
             ));
         }
     }
-    if let Some(database_type @ (DatabaseType::Dameng | DatabaseType::Vastbase | DatabaseType::Oscar)) =
-        options.database_type
+    if let Some(
+        database_type @ (DatabaseType::Dameng | DatabaseType::Vastbase | DatabaseType::Oscar | DatabaseType::Kingbase),
+    ) = options.database_type
     {
         comment_sql.extend(options.column_comments.iter().filter_map(|column| {
             if column.comment.trim().is_empty() {
                 return None;
             }
-            let column_name = quote_table_identifier(options.database_type, &column.name);
+            let column_name =
+                quote_table_data_identifier(options.database_type, &column.name, options.identifier_quote.as_deref());
             Some(format!(
                 "COMMENT ON COLUMN {target}.{column_name} IS {}",
                 quote_duplicate_table_comment(database_type, &column.comment)
@@ -1000,7 +1067,12 @@ pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
         options.identifier_quote.as_deref(),
     );
     let target = if options.normalize_new_target_name {
-        qualified_duplicate_target_name(options.database_type, options.schema.as_deref(), &options.target_name)
+        qualified_duplicate_target_name(
+            options.database_type,
+            options.schema.as_deref(),
+            &options.target_name,
+            options.identifier_quote.as_deref(),
+        )
     } else {
         qualified_name_with_quote(
             options.database_type,
@@ -1014,7 +1086,7 @@ pub fn build_copy_table_data_sql(options: CopyTableDataSqlOptions) -> String {
     };
     let source_column_list = columns
         .iter()
-        .map(|column| quote_table_identifier(options.database_type, column))
+        .map(|column| quote_table_data_identifier(options.database_type, column, options.identifier_quote.as_deref()))
         .collect::<Vec<_>>()
         .join(", ");
     // The unquoted Oracle clone DDL creates the target columns case-folded while the source
@@ -1163,8 +1235,13 @@ pub fn build_rename_object_sql(options: RenameObjectSqlOptions) -> Result<String
         return Ok(format!(
             "ALTER {} {} RENAME TO {};",
             object_type_keyword(options.object_type),
-            qualified_name(database_type, options.schema.as_deref(), &options.old_name),
-            quote_rename_identifier(database_type, &options.new_name)
+            qualified_name_with_quote(
+                database_type,
+                options.schema.as_deref(),
+                &options.old_name,
+                options.identifier_quote.as_deref(),
+            ),
+            quote_rename_identifier_with_quote(database_type, &options.new_name, options.identifier_quote.as_deref(),)
         ));
     }
 
@@ -1197,6 +1274,7 @@ pub fn build_rename_database_sql(
     old_name: &str,
     new_name: &str,
     terminate_connections: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<String, String> {
     if !supports_database_rename(database_type) {
         return Err(format!("Renaming databases is not supported for {}.", database_label(database_type)));
@@ -1210,8 +1288,8 @@ pub fn build_rename_database_sql(
     }
     parts.push(format!(
         "ALTER DATABASE {} RENAME TO {};",
-        quote_table_identifier(database_type, old_name),
-        quote_rename_identifier(database_type, new_name)
+        quote_rename_identifier_with_quote(database_type, old_name, identifier_quote),
+        quote_rename_identifier_with_quote(database_type, new_name, identifier_quote)
     ));
     Ok(parts.join("\n"))
 }
@@ -1283,6 +1361,7 @@ fn supports_duplicate_table_comment(database_type: DatabaseType) -> bool {
             | DatabaseType::Dameng
             | DatabaseType::Vastbase
             | DatabaseType::Oscar
+            | DatabaseType::Kingbase
     )
 }
 
@@ -1299,6 +1378,18 @@ fn quote_rename_identifier(database_type: Option<DatabaseType>, name: &str) -> S
         format!("`{}`", name.replace('`', "``"))
     } else {
         quote_table_identifier(database_type, name)
+    }
+}
+
+fn quote_rename_identifier_with_quote(
+    database_type: Option<DatabaseType>,
+    name: &str,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_connection_identifier_quote(database_type, identifier_quote) {
+        quote_table_data_identifier(database_type, name, identifier_quote)
+    } else {
+        quote_rename_identifier(database_type, name)
     }
 }
 
@@ -1344,12 +1435,17 @@ fn qualified_name_with_quote(
     }
 }
 
-fn qualified_duplicate_target_name(database_type: Option<DatabaseType>, schema: Option<&str>, name: &str) -> String {
+fn qualified_duplicate_target_name(
+    database_type: Option<DatabaseType>,
+    schema: Option<&str>,
+    name: &str,
+    identifier_quote: Option<&str>,
+) -> String {
     // Oracle's clone DDL creates plain identifiers unquoted (uppercase fold). Other types,
     // including Dameng's quoted structured CREATE TABLE, preserve the requested spelling.
     let target = match database_type {
         Some(DatabaseType::Oracle) => crate::table_structure_sql::oracle_new_object_reference(name),
-        _ => return qualified_name(database_type, schema, name),
+        _ => return qualified_name_with_quote(database_type, schema, name, identifier_quote),
     };
     if schema.is_some_and(|schema| !schema.is_empty()) {
         format!("{}.{}", quote_rename_identifier(database_type, schema.unwrap()), target)
@@ -1460,6 +1556,7 @@ mod tests {
                 name: "app db".to_string(),
                 charset: Some("utf8mb4".to_string()),
                 collation: Some("utf8mb4_unicode_ci".to_string()),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE `app db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
@@ -1477,6 +1574,7 @@ mod tests {
                 name: "app_db".to_string(),
                 charset: Some("utf8mb4".to_string()),
                 collation: Some("utf8mb4_unicode_ci".to_string()),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE `app_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
@@ -1501,6 +1599,7 @@ mod tests {
                     name: "analytics".to_string(),
                     charset: Some("utf8mb4".to_string()),
                     collation: Some("utf8mb4_unicode_ci".to_string()),
+                    identifier_quote: None,
                 })
                 .unwrap(),
                 "CREATE DATABASE `analytics`;"
@@ -1519,6 +1618,7 @@ mod tests {
                 name: "analytics".to_string(),
                 charset: Some("utf8mb4".to_string()),
                 collation: Some("utf8mb4_unicode_ci".to_string()),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE \"analytics\";"
@@ -1536,6 +1636,7 @@ mod tests {
                 name: "app_db".to_string(),
                 charset: Some("utf8mb4".to_string()),
                 collation: Some("utf8mb4_unicode_ci".to_string()),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE \"app_db\";"
@@ -1553,6 +1654,7 @@ mod tests {
                 name: "analytics db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE [analytics db];"
@@ -1566,6 +1668,7 @@ mod tests {
                 name: "analytics db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE \"analytics db\";"
@@ -1579,6 +1682,7 @@ mod tests {
                 name: "analytics db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE `analytics db`;"
@@ -1592,6 +1696,7 @@ mod tests {
                 name: "analytics db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE `analytics db`;"
@@ -1608,6 +1713,7 @@ mod tests {
             name: "analytics".to_string(),
             charset: None,
             collation: None,
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Creating databases is not supported"));
@@ -1619,6 +1725,7 @@ mod tests {
             name: "analytics".to_string(),
             charset: None,
             collation: None,
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Creating databases is not supported"));
@@ -1636,6 +1743,7 @@ mod tests {
                 name: "app_db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE app_db;"
@@ -1650,6 +1758,7 @@ mod tests {
                 name: "app_db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE app_db;"
@@ -1669,6 +1778,7 @@ mod tests {
                 name: "app_db".to_string(),
                 charset: Some("zh_CN.utf8".to_string()),
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "-- DBX_DB_LOCALE=zh_CN.utf8\nCREATE DATABASE app_db;"
@@ -1685,6 +1795,7 @@ mod tests {
             name: "app_db".to_string(),
             charset: None,
             collation: None,
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Creating databases is not supported"));
@@ -1697,6 +1808,7 @@ mod tests {
         assert!(build_create_schema_sql(SchemaNameSqlOptions {
             database_type: Some(DatabaseType::Informix),
             name: "app".to_string(),
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Creating schemas is not supported"));
@@ -1723,6 +1835,7 @@ mod tests {
                 name: "analytics db".to_string(),
                 charset: None,
                 collation: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE DATABASE IF NOT EXISTS `analytics db`;"
@@ -1731,6 +1844,7 @@ mod tests {
             build_drop_database_sql(DatabaseNameSqlOptions {
                 database_type: Some(DatabaseType::Transwarp),
                 name: "analytics db".to_string(),
+                identifier_quote: None,
             }),
             "DROP DATABASE IF EXISTS `analytics db`;"
         );
@@ -1748,6 +1862,7 @@ mod tests {
                 schema: Some("analytics".to_string()),
                 old_name: "old table".to_string(),
                 new_name: "new table".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE `analytics`.`old table` RENAME TO `analytics`.`new table`;"
@@ -1765,6 +1880,7 @@ mod tests {
                 charset: Some("utf8mb4".to_string()),
                 collation: Some("utf8mb4_unicode_ci".to_string()),
                 comment: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER DATABASE `app db` DEFAULT CHARACTER SET utf8mb4 DEFAULT COLLATE utf8mb4_unicode_ci;"
@@ -1778,6 +1894,7 @@ mod tests {
                 charset: Some("utf8mb4".to_string()),
                 collation: None,
                 comment: None,
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER DATABASE `app` DEFAULT CHARACTER SET utf8mb4;"
@@ -1795,6 +1912,7 @@ mod tests {
                 charset: None,
                 collation: None,
                 comment: Some("owner's app".to_string()),
+                identifier_quote: None,
             })
             .unwrap(),
             "COMMENT ON DATABASE \"app db\" IS 'owner''s app';"
@@ -1808,6 +1926,7 @@ mod tests {
                 charset: None,
                 collation: None,
                 comment: Some("".to_string()),
+                identifier_quote: None,
             })
             .unwrap(),
             "COMMENT ON SCHEMA \"public\" IS NULL;"
@@ -1824,6 +1943,7 @@ mod tests {
             charset: Some("utf8mb4".to_string()),
             collation: None,
             comment: None,
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("charset/collation is not supported"));
@@ -1835,6 +1955,7 @@ mod tests {
             charset: None,
             collation: None,
             comment: Some("comment".to_string()),
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("database comments is not supported"));
@@ -1846,6 +1967,7 @@ mod tests {
             charset: None,
             collation: None,
             comment: Some("comment".to_string()),
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("schema comments is not supported"));
@@ -1900,6 +2022,7 @@ mod tests {
             table_name: "events".to_string(),
             full: false,
             analyze: false,
+            identifier_quote: None,
         };
         assert_eq!(build_vacuum_table_sql(base.clone()).unwrap(), "VACUUM \"public\".\"events\";");
         assert_eq!(
@@ -1931,6 +2054,7 @@ mod tests {
                 table_name: "events".to_string(),
                 full: false,
                 analyze: false,
+                identifier_quote: None,
             })
             .is_ok());
         }
@@ -1940,6 +2064,7 @@ mod tests {
             table_name: "events".to_string(),
             full: false,
             analyze: false,
+            identifier_quote: None,
         })
         .is_err());
     }
@@ -2454,6 +2579,7 @@ mod tests {
             build_drop_database_sql(DatabaseNameSqlOptions {
                 database_type: Some(DatabaseType::Mysql),
                 name: "app db".to_string(),
+                identifier_quote: None,
             }),
             "DROP DATABASE `app db`;"
         );
@@ -2461,6 +2587,7 @@ mod tests {
             build_create_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Postgres),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE SCHEMA \"analytics\";"
@@ -2469,6 +2596,7 @@ mod tests {
             build_create_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::SqlServer),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE SCHEMA [analytics];"
@@ -2477,6 +2605,7 @@ mod tests {
             build_create_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Dameng),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE SCHEMA \"analytics\";"
@@ -2485,6 +2614,7 @@ mod tests {
             build_create_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Db2),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "CREATE SCHEMA \"analytics\";"
@@ -2492,6 +2622,7 @@ mod tests {
         assert!(build_create_schema_sql(SchemaNameSqlOptions {
             database_type: Some(DatabaseType::DuckDb),
             name: "analytics".to_string(),
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Creating schemas is not supported"));
@@ -2499,6 +2630,7 @@ mod tests {
             build_drop_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Kwdb),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             }),
             "DROP SCHEMA \"analytics\" CASCADE;"
         );
@@ -2506,6 +2638,7 @@ mod tests {
             build_drop_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Dameng),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             }),
             "DROP SCHEMA \"analytics\" CASCADE;"
         );
@@ -2513,6 +2646,7 @@ mod tests {
             build_drop_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Postgres),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             }),
             "DROP SCHEMA \"analytics\" CASCADE;"
         );
@@ -2520,6 +2654,7 @@ mod tests {
             build_drop_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::Mysql),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             }),
             "DROP SCHEMA `analytics`;"
         );
@@ -2527,6 +2662,7 @@ mod tests {
             build_drop_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::OceanbaseOracle),
                 name: "analytics".to_string(),
+                identifier_quote: None,
             }),
             "DROP USER \"analytics\" CASCADE;"
         );
@@ -2534,6 +2670,7 @@ mod tests {
             build_drop_schema_sql(SchemaNameSqlOptions {
                 database_type: Some(DatabaseType::OceanbaseOracle),
                 name: "ana\"lytics".to_string(),
+                identifier_quote: None,
             }),
             "DROP USER \"ana\"\"lytics\" CASCADE;"
         );
@@ -2603,6 +2740,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 table_name: "orders".to_string(),
                 name: "status".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"public\".\"orders\" DROP COLUMN \"status\";"
@@ -2614,6 +2752,7 @@ mod tests {
                 schema: None,
                 table_name: "orders".to_string(),
                 name: "idx_orders_status".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "DROP INDEX `idx_orders_status` ON `orders`;"
@@ -2625,6 +2764,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 table_name: "orders".to_string(),
                 name: "idx_orders_status".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "DROP INDEX \"public\".\"idx_orders_status\";"
@@ -2636,6 +2776,7 @@ mod tests {
                 schema: Some("analytics".to_string()),
                 table_name: "orders".to_string(),
                 name: "idx_orders_status".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "DROP INDEX \"analytics\".\"idx_orders_status\";"
@@ -2647,6 +2788,7 @@ mod tests {
                 schema: None,
                 table_name: "orders".to_string(),
                 name: "fk_orders_user".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE `orders` DROP FOREIGN KEY `fk_orders_user`;"
@@ -2658,6 +2800,7 @@ mod tests {
                 schema: Some("dbo".to_string()),
                 table_name: "orders".to_string(),
                 name: "fk_orders_user".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE [dbo].[orders] DROP CONSTRAINT [fk_orders_user];"
@@ -2669,6 +2812,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 table_name: "orders".to_string(),
                 name: "orders_audit".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "DROP TRIGGER \"orders_audit\" ON \"public\".\"orders\";"
@@ -2681,6 +2825,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 table_name: "orders".to_string(),
                 name: "status".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE `orders` DROP COLUMN `status`;"
@@ -2877,7 +3022,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_table_structure_comments_keep_other_dialects_unchanged() {
+    fn duplicate_table_structure_comments_follow_dialect_support() {
         for (database_type, expected) in [
             (
                 Some(DatabaseType::Postgres),
@@ -2885,7 +3030,10 @@ mod tests {
             ),
             (Some(DatabaseType::Mysql), "CREATE TABLE `copy` LIKE `source`;"),
             (Some(DatabaseType::Highgo), "CREATE TABLE \"copy\" AS SELECT * FROM \"source\" WHERE 1=0;"),
-            (Some(DatabaseType::Kingbase), "CREATE TABLE \"copy\" AS SELECT * FROM \"source\" WHERE 1=0;"),
+            (
+                Some(DatabaseType::Kingbase),
+                "CREATE TABLE \"copy\" AS SELECT * FROM \"source\" WHERE 1=0;\nCOMMENT ON TABLE \"copy\" IS '表注释';\nCOMMENT ON COLUMN \"copy\".\"note\" IS '字段注释';",
+            ),
             (Some(DatabaseType::DuckDb), "CREATE TABLE \"copy\" AS SELECT * FROM \"source\" WHERE 1=0;"),
             (None, "CREATE TABLE \"copy\" AS SELECT * FROM \"source\" WHERE 1=0;"),
         ] {
@@ -2907,6 +3055,44 @@ mod tests {
                 expected,
                 "{database_type:?}"
             );
+        }
+    }
+
+    #[test]
+    fn kingbase_mysql_clone_and_paste_use_connection_quotes() {
+        let structure = build_duplicate_table_structure_sql(DuplicateTableStructureSqlOptions {
+            database_type: Some(DatabaseType::Kingbase),
+            schema: Some("app".to_string()),
+            source_name: "order".to_string(),
+            target_name: "order`copy".to_string(),
+            table_comment: Some("Customer's orders".to_string()),
+            column_comments: vec![DuplicateTableColumnComment {
+                name: "item`note".to_string(),
+                comment: "Item note".to_string(),
+            }],
+            primary_key_columns: vec![],
+            primary_key_constraint_name: None,
+            identifier_quote: Some("`".to_string()),
+        });
+        assert_eq!(
+            structure,
+            "CREATE TABLE `app`.`order``copy` AS SELECT * FROM `app`.`order` WHERE 1=0;\nCOMMENT ON TABLE `app`.`order``copy` IS 'Customer''s orders';\nCOMMENT ON COLUMN `app`.`order``copy`.`item``note` IS 'Item note';"
+        );
+
+        for normalize_new_target_name in [true, false] {
+            let copy = build_copy_table_data_sql(CopyTableDataSqlOptions {
+                database_type: Some(DatabaseType::Kingbase),
+                schema: Some("app".to_string()),
+                source_name: "order".to_string(),
+                target_name: "order`copy".to_string(),
+                columns: Some(vec!["item`note".to_string()]),
+                postgres_overriding_system_value: false,
+                sqlserver_identity_insert: false,
+                dameng_identity_insert: false,
+                normalize_new_target_name,
+                identifier_quote: Some("`".to_string()),
+            });
+            assert_eq!(copy, "INSERT INTO `app`.`order``copy` (`item``note`) SELECT `item``note` FROM `app`.`order`;");
         }
     }
 
@@ -3468,6 +3654,7 @@ mod tests {
                 transwarp_create: None,
                 partitioned: false,
                 foreign_table: false,
+                table_type: None,
                 is_gaussdb_m_mode: false,
                 table_collation: None,
                 primary_key_name: None,
@@ -3514,6 +3701,7 @@ mod tests {
                     schema: None,
                     old_name: old_name.to_string(),
                     new_name: new_name.to_string(),
+                    identifier_quote: None,
                 })
                 .unwrap(),
                 expected
@@ -3533,6 +3721,7 @@ mod tests {
                 schema: None,
                 old_name: "old_name".to_string(),
                 new_name: "new_name".to_string(),
+                identifier_quote: None,
             })
             .is_err());
         }
@@ -3546,6 +3735,7 @@ mod tests {
             schema: Some("APP".to_string()),
             old_name: "orders".to_string(),
             new_name: "orders_copy".to_string(),
+            identifier_quote: None,
         };
         assert!(supports_object_rename(options.database_type, options.object_type));
         assert_eq!(
@@ -3563,6 +3753,7 @@ mod tests {
                 schema: None,
                 old_name: "users".to_string(),
                 new_name: "app users".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "RENAME TABLE `users` TO `app users`;"
@@ -3574,6 +3765,7 @@ mod tests {
                 schema: None,
                 old_name: "active_users".to_string(),
                 new_name: "enabled_users".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "RENAME TABLE `active_users` TO `enabled_users`;"
@@ -3599,6 +3791,7 @@ mod tests {
                     schema: Some("main".to_string()),
                     old_name: "users".to_string(),
                     new_name: "app users".to_string(),
+                    identifier_quote: None,
                 })
                 .unwrap(),
                 expected
@@ -3617,6 +3810,7 @@ mod tests {
                 schema: Some("main".to_string()),
                 old_name: "users".to_string(),
                 new_name: "app users".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"main\".\"users\" RENAME TO \"app users\";"
@@ -3632,6 +3826,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 old_name: "orders".to_string(),
                 new_name: "archived orders".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"public\".\"orders\" RENAME TO \"archived orders\";"
@@ -3643,6 +3838,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 old_name: "active_users".to_string(),
                 new_name: "enabled_users".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER VIEW \"public\".\"active_users\" RENAME TO \"enabled_users\";"
@@ -3662,6 +3858,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 old_name: "orders".to_string(),
                 new_name: "archived orders".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"public\".\"orders\" RENAME TO \"archived orders\";"
@@ -3673,6 +3870,7 @@ mod tests {
                 schema: Some("public".to_string()),
                 old_name: "active_users".to_string(),
                 new_name: "enabled_users".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER VIEW \"public\".\"active_users\" RENAME TO \"enabled_users\";"
@@ -3688,6 +3886,7 @@ mod tests {
                 schema: Some("dbo".to_string()),
                 old_name: "fn_total".to_string(),
                 new_name: "fn_order_total".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "EXEC sp_rename N'dbo.fn_total', N'fn_order_total', N'OBJECT';"
@@ -3704,6 +3903,7 @@ mod tests {
                 schema: Some("HR".to_string()),
                 old_name: "EMPLOYEES".to_string(),
                 new_name: "STAFF".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"HR\".\"EMPLOYEES\" RENAME TO \"STAFF\";"
@@ -3715,6 +3915,7 @@ mod tests {
                 schema: Some("SYSDBA".to_string()),
                 old_name: "ACTIVE_USERS".to_string(),
                 new_name: "ENABLED_USERS".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER VIEW \"SYSDBA\".\"ACTIVE_USERS\" RENAME TO \"ENABLED_USERS\";"
@@ -3729,6 +3930,7 @@ mod tests {
                 schema: Some("APP".to_string()),
                 old_name: "ORDERS".to_string(),
                 new_name: "ORDERS__DBX_BAK".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"APP\".\"ORDERS\" RENAME TO \"ORDERS__DBX_BAK\";"
@@ -3745,6 +3947,7 @@ mod tests {
                 schema: Some("SYSDBA".to_string()),
                 old_name: "OLD_USERS".to_string(),
                 new_name: "NEW_USERS".to_string(),
+                identifier_quote: None,
             })
             .unwrap(),
             "ALTER TABLE \"SYSDBA\".\"OLD_USERS\" RENAME TO \"NEW_USERS\";"
@@ -3761,6 +3964,7 @@ mod tests {
             schema: Some("SYSDBA".to_string()),
             old_name: "REFRESH_CACHE".to_string(),
             new_name: "REFRESH_CACHE_V2".to_string(),
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Renaming PROCEDURE is not supported"));
@@ -3770,6 +3974,7 @@ mod tests {
             schema: None,
             old_name: "refresh_cache".to_string(),
             new_name: "refresh_cache_v2".to_string(),
+            identifier_quote: None,
         })
         .unwrap_err()
         .contains("Renaming PROCEDURE is not supported"));
@@ -3779,11 +3984,11 @@ mod tests {
     fn builds_postgres_database_rename_sql() {
         assert!(supports_database_rename(Some(DatabaseType::Postgres)));
         assert_eq!(
-            build_rename_database_sql(Some(DatabaseType::Postgres), "old_db", "new db", false).unwrap(),
+            build_rename_database_sql(Some(DatabaseType::Postgres), "old_db", "new db", false, None).unwrap(),
             "ALTER DATABASE \"old_db\" RENAME TO \"new db\";"
         );
         // With terminate_connections
-        let sql = build_rename_database_sql(Some(DatabaseType::Postgres), "old_db", "new db", true).unwrap();
+        let sql = build_rename_database_sql(Some(DatabaseType::Postgres), "old_db", "new db", true, None).unwrap();
         assert!(sql.contains("pg_terminate_backend"), "should include terminate");
         assert!(sql.contains("ALTER DATABASE"), "should include rename");
     }
@@ -3803,7 +4008,7 @@ mod tests {
     fn rejects_unsupported_database_rename() {
         assert!(!supports_database_rename(Some(DatabaseType::Mysql)));
         assert!(!supports_database_rename(Some(DatabaseType::Sqlite)));
-        assert!(build_rename_database_sql(Some(DatabaseType::Mysql), "old_db", "new_db", false).is_err());
+        assert!(build_rename_database_sql(Some(DatabaseType::Mysql), "old_db", "new_db", false, None).is_err());
         assert!(build_rename_database_preflight_sql(Some(DatabaseType::Mysql), "old_db").is_err());
     }
 
@@ -3818,9 +4023,70 @@ mod tests {
             DatabaseType::Redshift,
         ] {
             assert!(supports_database_rename(Some(db_type)), "{db_type:?} should support database rename");
-            let sql = build_rename_database_sql(Some(db_type), "old_db", "new_db", false).unwrap();
+            let sql = build_rename_database_sql(Some(db_type), "old_db", "new_db", false, None).unwrap();
             assert!(sql.contains("ALTER DATABASE"), "{db_type:?}: missing ALTER DATABASE");
             assert!(sql.contains("RENAME TO"), "{db_type:?}: missing RENAME TO");
         }
+    }
+
+    #[test]
+    fn gaussdb_mysql_mode_uses_connection_backtick_quotes() {
+        // GaussDB in M/B/MYSQL compatibility mode reports a backtick identifier
+        // quote through the connection; the generated DDL must follow it instead
+        // of the static double-quote mapping (where `"` is a string literal).
+        let backtick = Some("`".to_string());
+        assert_eq!(
+            build_rename_database_sql(Some(DatabaseType::Gaussdb), "old_db", "new db", false, backtick.as_deref())
+                .unwrap(),
+            "ALTER DATABASE old_db RENAME TO `new db`;"
+        );
+        assert_eq!(
+            build_drop_database_sql(DatabaseNameSqlOptions {
+                database_type: Some(DatabaseType::Gaussdb),
+                name: "app db".to_string(),
+                identifier_quote: backtick.clone(),
+            }),
+            "DROP DATABASE `app db`;"
+        );
+        assert_eq!(
+            build_create_database_sql(CreateDatabaseSqlOptions {
+                database_type: Some(DatabaseType::Gaussdb),
+                driver_profile: None,
+                target: None,
+                parent: None,
+                name: "app db".to_string(),
+                charset: None,
+                collation: None,
+                identifier_quote: backtick.clone(),
+            })
+            .unwrap(),
+            "CREATE DATABASE `app db`;"
+        );
+        assert_eq!(
+            build_create_schema_sql(SchemaNameSqlOptions {
+                database_type: Some(DatabaseType::Gaussdb),
+                name: "analytics".to_string(),
+                identifier_quote: backtick.clone(),
+            })
+            .unwrap(),
+            "CREATE SCHEMA analytics;"
+        );
+        assert_eq!(
+            build_rename_object_sql(RenameObjectSqlOptions {
+                database_type: Some(DatabaseType::Gaussdb),
+                object_type: DatabaseObjectType::Table,
+                schema: Some("app".to_string()),
+                old_name: "orders".to_string(),
+                new_name: "orders new".to_string(),
+                identifier_quote: backtick,
+            })
+            .unwrap(),
+            "ALTER TABLE app.orders RENAME TO `orders new`;"
+        );
+        // Without a connection quote the static mapping still applies.
+        assert_eq!(
+            build_rename_database_sql(Some(DatabaseType::Gaussdb), "old_db", "new db", false, None).unwrap(),
+            "ALTER DATABASE \"old_db\" RENAME TO \"new db\";"
+        );
     }
 }

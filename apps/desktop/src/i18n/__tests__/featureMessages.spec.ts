@@ -111,6 +111,7 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
   { feature: "transfer bulk select", keys: under("transfer", ["bulkSelectObjects", "bulkSelectTitle", "bulkSelectHint", "bulkSelectPlaceholder", "bulkSelectConfirm", "bulkSelectMatched", "bulkSelectUnmatched", "noMatchingObjects"]), translated: true },
   { feature: "transfer background acknowledgement (#8649)", keys: ["transfer.backgroundStarted"], translated: true },
   { feature: "table info pin", keys: ["grid.pinTableInfo", "grid.unpinTableInfo"], translated: true },
+  { feature: "data grid row JSON preview", keys: ["grid.rowJsonPreview"], translated: true },
   {
     feature: "data grid structured sorting",
     keys: under("grid", [
@@ -168,6 +169,7 @@ const FEATURE_MESSAGES: FeatureMessages[] = [
     keys: under("settings", ["shortcutToggleBookmark", "shortcutNextBookmark", "shortcutPreviousBookmark"]),
     translated: true,
   },
+  { feature: "workspace bookmark list", keys: ["editor.bookmarks.*"], locales: ["en", "es", "it", "ja", "ko", "pt-BR", "ru", "th", "zh-CN", "zh-TW"], translated: true },
   { feature: "MCP history kind", keys: ["history.kinds.mcp"] },
   { feature: "editor selection to AI (#10058)", keys: under("ai", ["selectionChipLabel", "selectionChipDetail", "externalTargetUnavailable"]) },
   { feature: "SQL formatter layout style", keys: under("settings", ["sqlFormatterLayoutStyle", "sqlFormatterLayoutStyleDbx", "sqlFormatterLayoutStyleClassic"]) },

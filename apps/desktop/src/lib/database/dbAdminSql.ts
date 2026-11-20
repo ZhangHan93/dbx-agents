@@ -1,7 +1,10 @@
 import type { ColumnInfo, ConnectionConfig, DatabaseObjectType, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database";
 import * as api from "@/lib/backend/api";
+import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { createColumnDrafts, createForeignKeyDrafts, createIndexDrafts, createTriggerDrafts } from "@/lib/table/tableStructureEditorState";
 import type { BuildTableStructureChangeSqlOptions } from "@/lib/table/tableStructureEditorSql";
+import { tableDataCopyColumnOptions } from "@/lib/table/tableClipboard";
+import { isMissingKingbaseCatalogOid, isUnsupportedKingbaseTableComment } from "./kingbaseCatalogCompatibility";
 import { buildOceanbaseTableClone, type OceanbaseTableClone } from "./oceanbaseTableClone";
 
 export interface DropObjectSqlOptions {
@@ -58,6 +61,10 @@ export interface VacuumTableSqlOptions {
   tableName: string;
   full?: boolean;
   analyze?: boolean;
+  /** Quote character reported by the connected server, for types whose quote is not fixed by the
+   * database type alone (Cloud Spanner's two dialects differ). Mirrors `identifierQuote` on the
+   * table-data SQL options. */
+  identifierQuote?: string;
 }
 
 export interface MysqlAutoIncrementSqlOptions {
@@ -76,16 +83,28 @@ export interface DropTableChildObjectSqlOptions {
   schema?: string | null;
   tableName: string;
   name: string;
+  /** Quote character reported by the connected server, for types whose quote is not fixed by the
+   * database type alone (Cloud Spanner's two dialects differ). Mirrors `identifierQuote` on the
+   * table-data SQL options. */
+  identifierQuote?: string;
 }
 
 export interface DatabaseNameSqlOptions {
   databaseType?: DatabaseType;
   name: string;
+  /** Quote character reported by the connected server, for types whose quote is not fixed by the
+   * database type alone (Cloud Spanner's two dialects differ). Mirrors `identifierQuote` on the
+   * table-data SQL options. */
+  identifierQuote?: string;
 }
 
 export interface SchemaNameSqlOptions {
   databaseType?: DatabaseType;
   name: string;
+  /** Quote character reported by the connected server, for types whose quote is not fixed by the
+   * database type alone (Cloud Spanner's two dialects differ). Mirrors `identifierQuote` on the
+   * table-data SQL options. */
+  identifierQuote?: string;
 }
 
 export interface SchemaCommentSqlOptions extends SchemaNameSqlOptions {
@@ -100,6 +119,10 @@ export interface DatabasePropertyEditSqlOptions {
   charset?: string;
   collation?: string;
   comment?: string;
+  /** Quote character reported by the connected server, for types whose quote is not fixed by the
+   * database type alone (Cloud Spanner's two dialects differ). Mirrors `identifierQuote` on the
+   * table-data SQL options. */
+  identifierQuote?: string;
 }
 
 export interface DuplicateTableStructureSqlOptions {
@@ -126,12 +149,15 @@ export interface DuplicateTableStructurePlanOptions extends DuplicateTableStruct
   database: string;
   catalog?: string;
   sourceColumns?: ColumnInfo[];
+  copyData?: boolean;
 }
 
 export interface DuplicateTableStructurePlan {
   sql: string;
   sourceColumns?: ColumnInfo[];
   executeAsScript: boolean;
+  /** True when the clone ran without enough Kingbase metadata to guarantee comment preservation. */
+  commentMetadataIncomplete?: boolean;
   oceanbaseClone?: OceanbaseTableClone;
 }
 
@@ -346,20 +372,52 @@ export async function buildDuplicateTableStructurePlan(options: DuplicateTableSt
     return { sql, sourceColumns: columns, executeAsScript: primaryKeyColumns.length > 0 || !!tableComment?.trim() || columnComments.length > 0 || duplicateTableStructureRequiresScript(sql) };
   }
 
-  let sourceColumns = options.sourceColumns;
-  if (options.databaseType === "vastbase" || options.databaseType === "oscar") {
-    sourceColumns ??= await api.getColumns(options.connectionId, options.database, options.schema || "", options.sourceName, options.catalog);
+  const isKingbase = options.databaseType === "kingbase";
+  const copyColumnComments = options.databaseType === "vastbase" || options.databaseType === "oscar" || isKingbase;
+  const schema = options.schema || "";
+  const columns = options.sourceColumns;
+  let commentMetadataIncomplete = false;
+  const loadColumns = async () => {
+    if (columns || !copyColumnComments) return columns;
+    try {
+      return await api.getColumns(options.connectionId, options.database, schema, options.sourceName, options.catalog);
+    } catch (error) {
+      if (isKingbase && !options.copyData && isMissingKingbaseCatalogOid(error)) {
+        commentMetadataIncomplete = true;
+        return undefined;
+      }
+      throw error;
+    }
+  };
+  const tableCommentPromise =
+    isKingbase && options.tableComment == null
+      ? api.getTableComment(options.connectionId, options.database, schema, options.sourceName, options.catalog).catch((error) => {
+          if (isUnsupportedKingbaseTableComment(error)) {
+            commentMetadataIncomplete = true;
+            return null;
+          }
+          throw error;
+        })
+      : options.tableComment;
+  const [sourceColumns, tableComment] = await Promise.all([loadColumns(), tableCommentPromise]);
+  if (isKingbase && options.copyData && tableDataCopyColumnOptions("kingbase", sourceColumns ?? []).columns.length === 0) {
+    throw new Error("No writable columns available for table data copy.");
   }
   const sql = await buildDuplicateTableStructureSql({
     databaseType: options.databaseType,
     schema: options.schema,
     sourceName: options.sourceName,
     targetName: options.targetName,
-    tableComment: options.tableComment,
-    columnComments: options.databaseType === "vastbase" || options.databaseType === "oscar" ? collectDuplicateTableColumnComments(sourceColumns ?? []) : [],
+    tableComment,
+    columnComments: copyColumnComments ? collectDuplicateTableColumnComments(sourceColumns ?? []) : [],
     identifierQuote: options.identifierQuote,
   });
-  return { sql, sourceColumns, executeAsScript: duplicateTableStructureRequiresScript(sql) };
+  return {
+    sql,
+    sourceColumns,
+    executeAsScript: duplicateTableStructureRequiresScript(sql),
+    ...(commentMetadataIncomplete ? { commentMetadataIncomplete: true } : {}),
+  };
 }
 
 export interface CopyTableDataSqlOptions {
@@ -479,6 +537,15 @@ export function buildSetSchemaCommentSql(options: SchemaCommentSqlOptions): stri
 
 export function buildDuplicateTableStructureSql(options: DuplicateTableStructureSqlOptions): Promise<string> {
   return api.buildDuplicateTableStructureSql(options);
+}
+
+export function kingbaseDuplicateStructureTransaction(plan: DuplicateTableStructurePlan, { databaseType, connectionId, database, schema, catalog }: Pick<DuplicateTableStructurePlanOptions, "databaseType" | "connectionId" | "database" | "schema" | "catalog">) {
+  if (databaseType !== "kingbase" || !plan.executeAsScript) return undefined;
+
+  return () => {
+    const statements = splitSqlStatementRanges(plan.sql, "kingbase").map(({ sql }) => sql);
+    return api.executeInTransaction(connectionId, database, statements, schema ?? undefined, catalog);
+  };
 }
 
 export function duplicateTableStructureRequiresScript(sql: string): boolean {

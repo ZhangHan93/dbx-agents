@@ -477,6 +477,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ sidebarDensity: 123 } as any).sidebarDensity).toBe("default");
   });
 
+  it("keeps original connection icons for missing or invalid saved preferences", () => {
+    expect(normalizeEditorSettings({}).sidebarConnectionIconStyle).toBe("classic");
+    expect(normalizeEditorSettings({ sidebarConnectionIconStyle: "badge" }).sidebarConnectionIconStyle).toBe("badge");
+    expect(normalizeEditorSettings({ sidebarConnectionIconStyle: "unknown" } as any).sidebarConnectionIconStyle).toBe("classic");
+  });
+
   it("uses inline comments by default and preserves legacy comment visibility", () => {
     expect(normalizeEditorSettings({}).sidebarObjectInfoMode).toBe("comment-inline");
     expect(normalizeEditorSettings({ sidebarObjectInfoMode: "comment-aligned" }).sidebarObjectInfoMode).toBe("comment-aligned");
@@ -1388,6 +1394,14 @@ describe("normalizeEditorSettings - colorizeConnectionTabsScope", () => {
     expect(normalizeEditorSettings({ colorizeConnectionTabsScope: undefined } as any).colorizeConnectionTabsScope).toBe("all");
     expect(normalizeEditorSettings({ colorizeConnectionTabsScope: null } as any).colorizeConnectionTabsScope).toBe("all");
     expect(normalizeEditorSettings({ colorizeConnectionTabsScope: 123 } as any).colorizeConnectionTabsScope).toBe("all");
+  });
+});
+
+describe("normalizeEditorSettings - crossWindowTabDragPreviewEnabled", () => {
+  it("defaults to enabled and only accepts booleans", () => {
+    expect(normalizeEditorSettings({}).crossWindowTabDragPreviewEnabled).toBe(true);
+    expect(normalizeEditorSettings({ crossWindowTabDragPreviewEnabled: false }).crossWindowTabDragPreviewEnabled).toBe(false);
+    expect(normalizeEditorSettings({ crossWindowTabDragPreviewEnabled: "false" } as any).crossWindowTabDragPreviewEnabled).toBe(true);
   });
 });
 

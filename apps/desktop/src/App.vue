@@ -129,8 +129,10 @@ import type { ConnectionConfig, DatabaseType, ObjectBrowserFilter, ObjectSourceK
 import { OPEN_PLUGIN_SETTINGS, type PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 import { parsePluginInstallDeepLink } from "@/lib/plugins/pluginInstallDeepLink";
 import { createFrontendPluginRegistry, pluginConnectionProviderDefaultPort } from "@/lib/plugins/frontendPlugin";
-import { parseConnectionDeepLink, parseConnectionDeepLinkUpdate, type ConnectionDeepLinkDraft, type ConnectionDeepLinkPluginProvider, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
-import { resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
+import { parseConnectionDeepLink, parseConnectionDeepLinkUpdate, type ConnectionDeepLinkDraft, type ConnectionDeepLinkPluginProvider } from "@/lib/connection/connectionDeepLink";
+import { resolveSavedConnectionForEdit } from "@/lib/connection/connectionDeepLinkUpdate";
+import { resolveConnectionEditPrefill, type ConnectionEditPrefill } from "@/lib/connection/connectionEditPrefill";
+import { PLUGIN_CONNECTION_EDITOR, pluginConnectionEditFields } from "@/lib/connection/pluginConnectionEdit";
 import { parseAiConfigDeepLink, type AiConfigDeepLinkDraft } from "@/lib/ai/aiConfigDeepLink";
 import { activeDesktopAiRuns, blockingDesktopAiRunsForQuit } from "@/lib/ai/desktopAiRunRegistry";
 import type { GlobalNavigationEntry, GlobalNavigationKind, GlobalNavigationSurface } from "@/lib/navigation/navigationEntry";
@@ -221,6 +223,11 @@ import { subscribeSavedSqlLibraryChanges } from "@/lib/savedSql/savedSqlLibraryE
 import { savedSqlDefaultTargetForWrite } from "@/lib/savedSql/savedSqlExecutionTarget";
 import { countActiveUpdateBlockingTasks } from "@/lib/app/appUpdateTaskGuard";
 import { initSavedSqlEditorPositions } from "@/lib/app/savedSqlEditorPosition";
+import { consumeDetachedTabTransfer, markTabWindowTransferAccepted, tabWindowTransferEntries } from "@/lib/tabs/tabWindowTransfer";
+import { TAB_WINDOW_TRANSFER, useTabWindowTransfer } from "@/composables/useTabWindowTransfer";
+import { restoreWorkspaceWindows } from "@/lib/app/workspaceWindows";
+import { useWindowSettingsSync } from "@/composables/useWindowSettingsSync";
+import { useWindowConnectionSync } from "@/composables/useWindowConnectionSync";
 import { dismissOpenModalSurface } from "@/lib/ui/modalSurface";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { objectBrowserTablesToAiTreeNodes } from "@/lib/ai/objectBrowserToAiTargets";
@@ -255,7 +262,7 @@ const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAss
 const PluginWorkbenchTab = defineAsyncComponent(() => import("@/components/plugins/PluginWorkbenchTab.vue"));
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
-const SqlFilePanel = defineAsyncComponent(() => import("@/components/layout/SqlFilePanel.vue"));
+const SqlFilesBookmarksDock = defineAsyncComponent(() => import("@/components/layout/SqlFilesBookmarksDock.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
 const PluginCenterPage = defineAsyncComponent(() => import("@/components/plugins/PluginContributionsPanel.vue"));
 const PluginBottomDock = defineAsyncComponent(() => import("@/components/plugins/PluginBottomDock.vue"));
@@ -296,8 +303,12 @@ const { t, locale: appLocale } = useI18n();
 const startupProps = defineProps<{ startupAuthentication?: StartupAuthentication }>();
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
+const tabWindowTransfer = useTabWindowTransfer({ canCloseEmptyWindow: () => !settingsPageTabOpen.value && !pluginCenterTabOpen.value && !driverStoreTabOpen.value });
+provide(TAB_WINDOW_TRANSFER, tabWindowTransfer);
 const navigationStore = useNavigationStore();
 const settingsStore = useSettingsStore();
+useWindowSettingsSync();
+useWindowConnectionSync();
 const { active: appBackgroundActive, backgroundObjectUrl: appBackgroundObjectUrl, backgroundImageStyle: appBackgroundImageStyle } = useBackgroundImage(settingsStore);
 const editorFontFamilyStyle = useEditorFontFamilyStyle();
 const { uiFontFamilyPreview } = useUiFontFamilyPreview();
@@ -485,8 +496,14 @@ const appReady = computed(() => !setupRequired.value && (!needsAuth.value || aut
 
 const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
-const connectionDialogUpdate = ref<ConnectionDeepLinkUpdate | null>(null);
+const connectionDialogUpdate = ref<ConnectionEditPrefill | null>(null);
 const connectionDialogInitialTab = ref<ConfigTab | undefined>(undefined);
+if (isTauriRuntime() && !isDetachedWindowContext) {
+  provide(PLUGIN_CONNECTION_EDITOR, {
+    getFields: (connectionId) => pluginConnectionEditFields(resolveSavedConnectionForEdit(connectionId, connectionStore.connections)),
+    openEdit: ({ connectionId, fields = {} }) => openConnectionUpdate({ source: "plugin", connectionId, patch: fields }),
+  });
+}
 const settingsPageTabOpen = ref(false);
 const settingsInitialTab = ref("appearance");
 const settingsInitialSection = ref<string | undefined>(undefined);
@@ -549,6 +566,21 @@ watch(
 const sqlFileLocateRequest = ref<{ id: number; path: string } | null>(null);
 let sqlFileLocateRequestId = 0;
 const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
+const sqlFilesDockTab = ref<"files" | "bookmarks">(safeLocalStorageGet("dbx-sql-files-dock-tab") === "bookmarks" ? "bookmarks" : "files");
+watch(sqlFilesDockTab, (tab) => safeLocalStorageSet("dbx-sql-files-dock-tab", tab));
+function openBookmarksPanel() {
+  sqlFilesDockTab.value = "bookmarks";
+  isZenMode.value = false;
+  openRightSidebarPanel("sqlFile");
+}
+function toggleSqlFilesPanel() {
+  if (showSqlFilePanel.value && sqlFilesDockTab.value === "bookmarks") {
+    sqlFilesDockTab.value = "files";
+    return;
+  }
+  sqlFilesDockTab.value = "files";
+  toggleRightSidebarPanel("sqlFile");
+}
 watch(
   showSqlFilePanel,
   (open) => {
@@ -1433,7 +1465,15 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openPluginInstallDeepLink,
   refreshPluginWorkbenches,
 });
-const { showCloseActionPrompt, chooseQuit, chooseMinimize, cancelCloseActionPrompt, performCloseAction, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt({ requestClose: requestAppClose });
+const { showCloseActionPrompt, isQuitPrepared, cancelAppQuit, chooseQuit, chooseMinimize, cancelCloseActionPrompt, performCloseAction, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt({
+  requestClose: requestAppClose,
+  onQuitCancelled: () => {
+    if (pendingAppCloseAction.value === "quit") {
+      queryStore.cancelClosePendingTab();
+      resetPendingAppClose();
+    }
+  },
+});
 useVisibilityChange();
 useWebDavAutoUpload();
 useSnippetAutoUpload();
@@ -2504,7 +2544,12 @@ function closePendingSavedTab() {
   pendingPrevActiveTabId.value = null;
   const shouldCloseTab = pendingSaveShouldCloseTab.value;
   pendingSaveShouldCloseTab.value = true;
-  if (shouldCloseTab) queryStore.closeTab(closeId, { force: true });
+  if (shouldCloseTab) {
+    queryStore.closeTab(closeId, { force: true });
+    return;
+  }
+  // 关闭工作区时，标签会保留到保存完成；保存后继续完成挂起的窗口关闭。
+  completePendingTabSave(closeId);
 }
 
 function cancelPendingSaveAndClose() {
@@ -2518,6 +2563,11 @@ function cancelPendingSaveAndClose() {
 }
 
 function cancelPendingAppClose() {
+  if (pendingAppCloseAction.value === "quit" || isQuitPrepared.value) cancelAppQuit();
+  resetPendingAppClose();
+}
+
+function resetPendingAppClose() {
   pendingAppCloseAction.value = null;
   pendingCloseActionChoice.value = false;
   showAiRunsClosePrompt.value = false;
@@ -2550,19 +2600,28 @@ async function finishPendingAppClose(action: AppCloseAction) {
   }
   pendingAppCloseAction.value = null;
   pendingSaveShouldCloseTab.value = true;
+  if (action === "quit") isQuitPrepared.value = true;
   const disposeRuntimeBeforeClose = () => (action === "quit" ? disposeAllSqlServerActivityTraces().catch(() => undefined) : Promise.resolve());
-  if (queryStore.requiresAppCloseDraftPersist) {
+  if (isDesktop || queryStore.requiresAppCloseDraftPersist) {
     await finishAppCloseWithRequiredPersist({
       persist: () => queryStore.flushPendingPersist(),
       beforeClose: disposeRuntimeBeforeClose,
-      close: () => performCloseAction(action),
-      onPersistError: (error) =>
+      close: async () => {
+        try {
+          await performCloseAction(action);
+        } catch (error) {
+          toast(String(error), 8000);
+        }
+      },
+      onPersistError: (error) => {
+        if (action === "quit") cancelAppQuit();
         toast(
           t("settings.appCloseDraftPersistFailed", {
             message: error instanceof Error ? error.message : String(error),
           }),
           8000,
-        ),
+        );
+      },
     });
     return;
   }
@@ -2601,20 +2660,24 @@ function handleWebBeforeUnload(event: BeforeUnloadEvent) {
 function continuePendingAppCloseAfterSave() {
   const action = pendingAppCloseAction.value;
   if (!action) return;
-  if (queryStore.hasDirtyTabs) {
+  if (queryStore.hasUnsavedWindowTabs) {
     pendingSaveShouldCloseTab.value = false;
-    if (queryStore.requestAppCloseConfirmation()) return;
+    if (queryStore.requestWindowCloseConfirmation()) return;
   }
   finishPendingAppClose(action);
 }
 
 function requestAppClose(action: AppCloseAction, options: AppCloseRequestOptions = {}) {
-  if (isUpdatePreparationActive()) return;
+  if (pendingAppCloseAction.value || isQuitPrepared.value || isUpdatePreparationActive()) return;
+  if (isDesktop && !isDetachedWindowContext && !queryStore.isOpenTabsLoaded) {
+    if (action === "quit") cancelAppQuit();
+    return;
+  }
   pendingCloseActionChoice.value = !!options.requireCloseActionChoice;
-  if (queryStore.hasDirtyTabs) {
+  if (queryStore.hasUnsavedWindowTabs) {
     pendingAppCloseAction.value = action;
     pendingSaveShouldCloseTab.value = false;
-    if (queryStore.requestAppCloseConfirmation()) return;
+    if (queryStore.requestWindowCloseConfirmation()) return;
   }
   finishPendingAppClose(action);
 }
@@ -2934,7 +2997,7 @@ async function openSaveSqlDialog(tabId?: string) {
 }
 
 async function saveActiveObjectSource(tab: QueryTab): Promise<boolean> {
-  return saveObjectSourceTab(tab, { connection: connectionStore.getConfig(tab.connectionId), queryStore, t, toast });
+  return saveObjectSourceTab(tab, { connection: connectionStore.getConfig(tab.connectionId), queryStore, t, toast, identifierQuote: connectionStore.connectionIdentifierQuote?.(tab.connectionId) });
 }
 
 function saveSqlFolderDisplayName(id: string) {
@@ -3248,19 +3311,23 @@ async function deepLinkPluginConnectionProviders(): Promise<ConnectionDeepLinkPl
   }
 }
 
+function openConnectionUpdate(update: ConnectionEditPrefill) {
+  const config = resolveConnectionEditPrefill(update, connectionStore.connections, showConnectionDialog.value || !!connectionStore.editingConnectionId);
+  connectionDialogPrefill.value = null;
+  connectionDialogUpdate.value = update;
+  connectionPluginProvider.value = null;
+  connectionDialogInitialTab.value = "connection";
+  connectionStore.stopCreatingConnectionInGroup();
+  connectionStore.startEditing(config.id);
+  showConnectionDialog.value = true;
+}
+
 async function openConnectionDeepLink(url: string) {
   await connectionStore.initFromDisk();
   try {
     const update = parseConnectionDeepLinkUpdate(url);
     if (update) {
-      const config = resolveConnectionDeepLinkUpdate(update, connectionStore.connections, showConnectionDialog.value || !!connectionStore.editingConnectionId);
-      connectionDialogPrefill.value = null;
-      connectionDialogUpdate.value = update;
-      connectionPluginProvider.value = null;
-      connectionDialogInitialTab.value = "connection";
-      connectionStore.stopCreatingConnectionInGroup();
-      connectionStore.startEditing(config.id);
-      showConnectionDialog.value = true;
+      openConnectionUpdate(update);
       return;
     }
     const draft = parseConnectionDeepLink(url, { pluginProviders: await deepLinkPluginConnectionProviders() });
@@ -3871,6 +3938,7 @@ function locateSqlFile(tab: QueryTab) {
   isZenMode.value = false;
   openRightSidebarPanel("sqlFile");
   sqlFileLocateRequest.value = { id: ++sqlFileLocateRequestId, path };
+  sqlFilesDockTab.value = "files";
 }
 
 function finishSqlFileLocate(requestId: number) {
@@ -4437,6 +4505,7 @@ async function handleQuickOpenSelect(item: any) {
         databaseType,
         sqlFormatter: settingsStore.editorSettings.sqlFormatter,
         signature: item.signature,
+        identifierQuote: connectionStore.connectionIdentifierQuote?.(item.connectionId),
       });
       const tabId = queryStore.createTab(item.connectionId, item.database, `Source - ${objectName}`, "query", undefined, undefined, undefined, { sourceView: true });
       queryStore.updateSql(tabId, editableSource);
@@ -4828,6 +4897,7 @@ function refreshPluginWorkbenches(pluginId: string): void {
 }
 
 async function closeActiveSurface() {
+  if (isQuitPrepared.value) return;
   // Cmd+W (and the native macOS "Close Tab" menu item) must not reach the surface behind
   // an open modal dialog. While a dialog owns the window the keystroke dismisses that
   // dialog instead, exactly like Esc, so the shortcut never goes dead on the user.
@@ -4841,6 +4911,9 @@ async function closeActiveSurface() {
   } else if (queryStore.activeTabId) {
     if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
     queryStore.closeTab(queryStore.activeTabId);
+  } else if (isDesktop && queryStore.tabs.length === 0) {
+    if (isDetachedWindowContext) await requestDetachedReturn("close");
+    else await api.requestAppClose();
   }
 }
 // App-scoped `:dbx` actions. Editor-scoped ones are handled (and stopped) in
@@ -4873,6 +4946,10 @@ function handleVimDbxAppAction(event: Event) {
 }
 
 async function handleKeydown(e: KeyboardEvent) {
+  if (isQuitPrepared.value) {
+    e.preventDefault();
+    return;
+  }
   if (e.defaultPrevented) return;
 
   // Every isXxxShortcut below normalizes what it is given; handing it an already
@@ -5236,6 +5313,7 @@ async function handleWebLogout() {
 async function initApp() {
   const t0 = performance.now();
   console.log("[STARTUP] initApp begin");
+  const detachedTransfer = await consumeDetachedTabTransfer();
   const savedSqlInitialization = Promise.all([initSavedSqlEditorPositions(), savedSqlStore.initFromStorage()])
     .then(() => {
       console.log(`[STARTUP]   savedSqlStore.initFromStorage: ${(performance.now() - t0).toFixed(0)}ms`);
@@ -5268,7 +5346,15 @@ async function initApp() {
     }
     markStartupPhase("connections-ready");
     console.log(`[STARTUP]   connectionStore.initFromDisk: ${(performance.now() - t0).toFixed(0)}ms`);
-    await queryStore.initOpenTabs({ validConnectionIds: connectionStore.connections.map((connection) => connection.id) });
+    await queryStore.initOpenTabs({ validConnectionIds: connectionStore.connections.map((connection) => connection.id), skipRestore: !!detachedTransfer });
+    if (detachedTransfer && queryStore.importTransferredTabs(tabWindowTransferEntries(detachedTransfer), detachedTransfer.activeTabId)) {
+      await queryStore.flushPendingPersist();
+      await markTabWindowTransferAccepted(detachedTransfer.transferId);
+    }
+    if (isDesktop) {
+      await queryStore.flushPendingPersist();
+      await restoreWorkspaceWindows();
+    }
     void restoreExportTasksFromStorage();
     markStartupPhase("tabs-restored");
     console.log(`[STARTUP]   queryStore.initOpenTabs: ${(performance.now() - t0).toFixed(0)}ms`);
@@ -5467,6 +5553,7 @@ onMounted(async () => {
         toast(error?.message || String(error), 5000);
         void finishDetachedWindowClose();
       });
+    setupCloseActionPromptListener();
     return;
   }
   requestAnimationFrame(() => {
@@ -5622,11 +5709,19 @@ onUnmounted(() => {
            webview 缩放是重排式的，最小尺寸必须除以实际倍率换算成 CSS 像素
            （见 appShellMinSizeStyleForScale）——固定 CSS 下限在约 165% 以上缩放
            时会超出视口，把应用底部（如设置页脚按钮）挤出窗口导致无法点击。 -->
-      <div data-app-shell class="h-screen w-screen max-w-full flex flex-col bg-background text-foreground overflow-hidden" :class="{ 'dbx-desktop-window-frame': drawDesktopWindowFrame }" :style="[appUiFontFamilyStyle, appShellMinSizeStyle]">
+      <div
+        data-app-shell
+        :inert="isQuitPrepared"
+        class="h-screen w-screen max-w-full flex flex-col bg-background text-foreground overflow-hidden"
+        :class="{ 'dbx-desktop-window-frame': drawDesktopWindowFrame, 'pointer-events-none': isQuitPrepared }"
+        :style="[appUiFontFamilyStyle, appShellMinSizeStyle]"
+      >
         <AppToolbar
           v-if="!isDetachedWindowContext"
           :is-dark="isDark"
           :theme-mode="themeMode"
+          :workspace-window-label="tabWindowTransfer.currentWindowLabel.value"
+          :workspace-window-targets="tabWindowTransfer.otherTabWindows.value"
           :show-sidebar-expand="!sidebarOpen && !isZenMode"
           :show-ai-panel="showAiPanel"
           :active-ai-run-count="activeAiRunCount"
@@ -5660,7 +5755,8 @@ onUnmounted(() => {
           @toggle-ai="toggleRightSidebarPanel('ai')"
           @toggle-history="toggleRightSidebarPanel('history')"
           @toggle-sql-library="toggleRightSidebarPanel('sqlLibrary')"
-          @toggle-sql-file-panel="toggleRightSidebarPanel('sqlFile')"
+          @toggle-sql-file-panel="toggleSqlFilesPanel"
+          @open-bookmarks="openBookmarksPanel"
           @open-github="openGitHub"
           @open-settings="openSettings(showMcpSettingsUpdateBadge ? 'mcp' : 'appearance')"
           @open-driver-store="openDriverStorePage"
@@ -5674,6 +5770,9 @@ onUnmounted(() => {
           @open-data-compare="dialogs.showDataCompareDialog.value = true"
           @open-backups="openSettings('backups')"
           @open-mcp-settings="openSettings('mcp')"
+          @focus-workspace-window="tabWindowTransfer.focusWorkspaceWindow"
+          @refresh-workspace-windows="tabWindowTransfer.refreshOtherTabWindows"
+          @consolidate-workspace-windows="tabWindowTransfer.consolidateWorkspaceWindows"
           @logout="handleWebLogout"
         />
 
@@ -5706,7 +5805,6 @@ onUnmounted(() => {
           >
             <div class="h-full flex min-h-0 min-w-0 flex-col">
               <AppTabBar
-                v-if="!isDetachedWindowContext"
                 ref="appTabBarRef"
                 :driver-store-open="driverStoreTabOpen"
                 :driver-store-active="driverStoreActive"
@@ -5792,7 +5890,7 @@ onUnmounted(() => {
                 />
               </AppTabBar>
               <DetachedTabHeader
-                v-else-if="activeTab"
+                v-if="isDetachedWindowContext && activeTab"
                 :title="activeTab.title"
                 :dirty="queryStore.isTabDirty(activeTab)"
                 :show-ai-panel="showAiPanel"
@@ -5871,7 +5969,7 @@ onUnmounted(() => {
                     @execute-in-new-result-tab="(tabId: string, override?: SqlExecutionOverride) => tryExecuteInNewResultTab(override, { tabId })"
                     @cancel="(tabId: string) => cancelActiveExecution(tabId)"
                     @explain="(tabId: string) => tryExplain(undefined, { tabId })"
-                    @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
+                    @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v, 'editor')"
                     @editor-selection-change="
                       (tabId: string, v: string) => {
                         if (tabId === queryStore.activeTabId) selectedSql = v;
@@ -6073,7 +6171,7 @@ onUnmounted(() => {
             :style="{ width: sqlFilePanelWidth + 'px' }"
           >
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
-              <SqlFilePanel :locate-request="sqlFileLocateRequest" @locate-handled="finishSqlFileLocate" @close="closeRightSidebarPanel('sqlFile')" />
+              <SqlFilesBookmarksDock v-model="sqlFilesDockTab" :locate-request="sqlFileLocateRequest" @locate-handled="finishSqlFileLocate" @close="closeRightSidebarPanel('sqlFile')" />
             </div>
             <div class="panel-resize-handle panel-resize-handle--left" @pointerdown="startSqlFilePanelResize" />
           </div>
